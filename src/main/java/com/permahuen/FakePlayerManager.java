@@ -178,7 +178,6 @@ public class FakePlayerManager {
     /* ---------- Persistence (JSON in world save dir) ---------- */
 
     private record Stored(UUID uuid, String name, RegistryKey<World> dimension, int x, int y, int z, int radius) {
-        RegistryKey<World> dimension() { return dimension; }
     }
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();

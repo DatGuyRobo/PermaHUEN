@@ -39,7 +39,7 @@ public class PermahuenCommands {
 
     private static int spawn(CommandContext<ServerCommandSource> context, String name, BlockPos pos) {
         ServerCommandSource source = context.getSource();
-        BlockPos spawnPos = (pos == null) ? source.getEntityOrThrow().getBlockPos() : pos;
+        BlockPos spawnPos = (pos != null) ? pos : BlockPos.ofFloored(source.getPosition());
 
         boolean success = PermahuenMod.playerManager.spawnPlayer(source.getServer(), name, source.getWorld(), spawnPos);
 
