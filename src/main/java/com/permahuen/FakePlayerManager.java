@@ -1,13 +1,13 @@
 package com.permahuen;
 
 import com.mojang.authlib.GameProfile;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.reflect.TypeToken;
 import net.fabricmc.fabric.api.entity.FakePlayer;
 import net.minecraft.entity.effect.StatusEffectInstance;
 import net.minecraft.entity.effect.StatusEffects;
-import net.minecraft.nbt.NbtCompound;
-import net.minecraft.nbt.NbtElement;
-import net.minecraft.nbt.NbtList;
-import net.minecraft.nbt.NbtOps;
+import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.RegistryKeys;
 import net.minecraft.server.MinecraftServer;
@@ -15,124 +15,138 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.WorldSavePath;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
-import net.minecraft.world.PersistentState;
-import net.minecraft.world.PersistentStateManager;
 import net.minecraft.world.World;
 
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 
 /**
- * Manager for persistent, chunk-loading fake players.
- *
- * Public API:
- *  - spawn(server, name, world, pos, radius)
- *  - kill(server, name)
- *  - list(server)
- *  - respawnAll(server)  // call on SERVER_STARTED
+ * FakePlayerManager for 1.21.x:
+ * - JSON persistence in the world save directory
+ * - Force-load chunks via ServerWorld#setChunkForced
+ * - API compatible with PermahuenMod/PermahuenCommands (load/save/spawnPlayer/killPlayer/listPlayers)
  */
 public class FakePlayerManager {
 
-    /** Spawns (or updates) a persistent fake player at the given position and radius. */
-    public static ServerPlayerEntity spawn(MinecraftServer server, String name, ServerWorld world, BlockPos pos, int radius) {
-        Objects.requireNonNull(server, "server");
-        Objects.requireNonNull(world, "world");
-        Objects.requireNonNull(name, "name");
-        if (radius < 0) radius = 0;
+    /* ---------- Public API expected by your other classes ---------- */
 
-        // Build a GameProfile and try to pull the user's skin
-        GameProfile profile = new GameProfile(null, name);
-        try {
-            server.getSessionService().fillProfileProperties(profile, true);
-        } catch (Exception ignored) { }
-
-        // Get/create the FakePlayer instance
-        ServerPlayerEntity fp = FakePlayer.get(world, profile);
-
-        // Move to target position and ensure it ticks
-        fp.refreshPositionAndAngles(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, fp.getYaw(), fp.getPitch());
-        if (!world.getPlayers().contains(fp)) {
-            world.spawnEntity(fp);
-        }
-
-        // Survival-safe buffs
-        applyBuffs(fp);
-
-        // Keep chunks loaded in a square radius
-        forceChunks(world, pos, radius, true);
-
-        // Persist record
-        State state = State.get(server);
-        Stored stored = new Stored(fp.getGameProfile().getId(), name, world.getRegistryKey(), pos, radius);
-        state.put(stored);
-        state.markDirty();
-
-        return fp;
-    }
-
-    /** Despawns and removes a persistent fake player by name. */
-    public static boolean kill(MinecraftServer server, String name) {
-        Objects.requireNonNull(server, "server");
-        Objects.requireNonNull(name, "name");
-
-        State state = State.get(server);
-        Stored stored = state.remove(name);
-        if (stored == null) return false;
-
-        ServerWorld world = server.getWorld(stored.dimension());
-        if (world != null) {
-            // Unforce chunks
-            forceChunks(world, stored.pos(), stored.radius(), false);
-
-            // Discard entity if present
-            GameProfile profile = new GameProfile(stored.uuid(), stored.name());
-            ServerPlayerEntity fp = FakePlayer.get(world, profile);
-            if (fp != null) {
-                fp.discard();
-            }
-        }
-
-        state.markDirty();
-        return true;
-    }
-
-    /** Returns all stored fake players (immutable). */
-    public static Collection<Stored> list(MinecraftServer server) {
-        return Collections.unmodifiableCollection(State.get(server).all());
-    }
-
-    /** Re-spawn all stored fake players. Call this on SERVER_STARTED. */
-    public static void respawnAll(MinecraftServer server) {
-        State state = State.get(server);
-        int count = 0;
-        for (Stored s : state.all()) {
+    public void load(MinecraftServer server) {
+        this.server = server;
+        readFromDisk();
+        // Respawn all persisted players
+        for (Stored s : records.values()) {
             try {
                 ServerWorld world = server.getWorld(s.dimension());
                 if (world == null) continue;
-
-                GameProfile profile = new GameProfile(s.uuid(), s.name());
-                try { server.getSessionService().fillProfileProperties(profile, true); } catch (Exception ignored) { }
-
+                GameProfile profile = (s.uuid != null) ? new GameProfile(s.uuid, s.name) : new GameProfile(null, s.name);
                 ServerPlayerEntity fp = FakePlayer.get(world, profile);
-                BlockPos pos = s.pos();
-                fp.refreshPositionAndAngles(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, fp.getYaw(), fp.getPitch());
-                if (!world.getPlayers().contains(fp)) {
-                    world.spawnEntity(fp);
-                }
+                BlockPos pos = new BlockPos(s.x, s.y, s.z);
+                fp.refreshPositionAndAngles(s.x + 0.5, s.y, s.z + 0.5, fp.getYaw(), fp.getPitch());
+                if (!world.getPlayers().contains(fp)) world.spawnEntity(fp);
                 applyBuffs(fp);
-                forceChunks(world, pos, s.radius(), true);
-                count++;
-            } catch (Exception e) {
-                server.getLogger().error("[FakePlayerManager] Failed to respawn {}: {}", s.name(), e.toString());
-            }
+                forceChunks(world, pos, s.radius, true);
+            } catch (Exception ignored) { }
         }
-        server.getLogger().info("[FakePlayerManager] Respawned {} fake players.", count);
     }
 
-    /* ------------------------------------------------------------ */
-    /* Helpers                                                      */
-    /* ------------------------------------------------------------ */
+    public void save() {
+        writeToDisk();
+    }
+
+    /**
+     * Spawn (and persist) a fake player at pos in world.
+     * Returns true if spawned/updated successfully.
+     */
+    public boolean spawnPlayer(MinecraftServer server, String name, ServerWorld world, BlockPos pos) {
+        ensureServer(server);
+        if (world == null || name == null || name.isBlank()) return false;
+
+        // If already stored, keep existing radius; else default radius=1
+        Stored prev = records.get(name);
+        int radius = (prev != null) ? prev.radius : 1;
+
+        GameProfile profile = (prev != null && prev.uuid != null)
+                ? new GameProfile(prev.uuid, name)
+                : new GameProfile(null, name);
+
+        ServerPlayerEntity fp = FakePlayer.get(world, profile);
+        fp.refreshPositionAndAngles(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, fp.getYaw(), fp.getPitch());
+        if (!world.getPlayers().contains(fp)) world.spawnEntity(fp);
+        applyBuffs(fp);
+
+        forceChunks(world, pos, radius, true);
+
+        Stored s = new Stored(profile.getId(), name, world.getRegistryKey(), pos.getX(), pos.getY(), pos.getZ(), radius);
+        records.put(name, s);
+        writeToDisk();
+        return true;
+    }
+
+    /**
+     * Despawn and forget a fake player by name.
+     * Returns true if removed.
+     */
+    public boolean killPlayer(String name) {
+        if (server == null) return false;
+        Stored s = records.remove(name);
+        if (s == null) return false;
+
+        ServerWorld world = server.getWorld(s.dimension());
+        if (world != null) {
+            forceChunks(world, new BlockPos(s.x, s.y, s.z), s.radius, false);
+            GameProfile profile = (s.uuid != null) ? new GameProfile(s.uuid, s.name) : new GameProfile(null, s.name);
+            ServerPlayerEntity fp = FakePlayer.get(world, profile);
+            if (fp != null) fp.discard();
+        }
+        writeToDisk();
+        return true;
+    }
+
+    /**
+     * Returns currently persisted+known fake players as entities if present,
+     * falling back to recreating the FakePlayer handles (not spawning).
+     */
+    public Collection<ServerPlayerEntity> listPlayers() {
+        List<ServerPlayerEntity> out = new ArrayList<>();
+        if (server == null) return out;
+        for (Stored s : records.values()) {
+            ServerWorld world = server.getWorld(s.dimension());
+            if (world == null) continue;
+            GameProfile profile = (s.uuid != null) ? new GameProfile(s.uuid, s.name) : new GameProfile(null, s.name);
+            ServerPlayerEntity fp = FakePlayer.get(world, profile);
+            out.add(fp);
+        }
+        return out;
+    }
+
+    /* ---------- Extra helpers if you want a command to change radius ---------- */
+
+    public boolean setRadius(String name, int radius) {
+        if (radius < 0) radius = 0;
+        Stored s = records.get(name);
+        if (s == null) return false;
+        records.put(name, new Stored(s.uuid, s.name, s.dimension, s.x, s.y, s.z, radius));
+        writeToDisk();
+        return true;
+    }
+
+    /* ---------- Internals ---------- */
+
+    private MinecraftServer server;
+    private final Map<String, Stored> records = new LinkedHashMap<>();
+
+    private void ensureServer(MinecraftServer srv) {
+        if (this.server == null) this.server = srv;
+    }
 
     private static void forceChunks(ServerWorld world, BlockPos pos, int radius, boolean force) {
         ChunkPos cp = new ChunkPos(pos);
@@ -143,118 +157,101 @@ public class FakePlayerManager {
         }
     }
 
-    /** Survival-safe: invulnerable + long-duration defensive effects. */
+    /** Survival-safe effects using 1.21.x RegistryEntry effects API. */
     private static void applyBuffs(ServerPlayerEntity p) {
         p.setInvulnerable(true);
-        ensureEffect(p, StatusEffects.RESISTANCE,       20 * 60 * 60, 4); // Resistance V
-        ensureEffect(p, StatusEffects.REGENERATION,     20 * 60 * 60, 2); // Regeneration III
-        ensureEffect(p, StatusEffects.SATURATION,       20 * 60 * 60, 0); // No hunger
+        ensureEffect(p, StatusEffects.RESISTANCE,       20 * 60 * 60, 4);
+        ensureEffect(p, StatusEffects.REGENERATION,     20 * 60 * 60, 2);
+        ensureEffect(p, StatusEffects.SATURATION,       20 * 60 * 60, 0);
         ensureEffect(p, StatusEffects.FIRE_RESISTANCE,  20 * 60 * 60, 0);
         ensureEffect(p, StatusEffects.WATER_BREATHING,  20 * 60 * 60, 0);
     }
 
-    private static void ensureEffect(ServerPlayerEntity p, net.minecraft.entity.effect.StatusEffect effect, int duration, int amplifier) {
+    private static void ensureEffect(ServerPlayerEntity p, RegistryEntry<net.minecraft.entity.effect.StatusEffect> effect,
+                                     int duration, int amplifier) {
         StatusEffectInstance cur = p.getStatusEffect(effect);
         if (cur == null || cur.getDuration() < 20 * 30 || cur.getAmplifier() < amplifier) {
             p.addStatusEffect(new StatusEffectInstance(effect, duration, amplifier, true, false));
         }
     }
 
-    /* ------------------------------------------------------------ */
-    /* Persistent State                                             */
-    /* ------------------------------------------------------------ */
+    /* ---------- Persistence (JSON in world save dir) ---------- */
 
-    /** Immutable stored record. */
-    public record Stored(UUID uuid, String name, RegistryKey<World> dimension, BlockPos pos, int radius) { }
+    private record Stored(UUID uuid, String name, RegistryKey<World> dimension, int x, int y, int z, int radius) {
+        RegistryKey<World> dimension() { return dimension; }
+    }
 
-    /** Persistent state kept in the Overworld's save data. */
-    static class State extends PersistentState {
-        private static final String NAME = "permahuen_fakeplayer_state_v1";
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final Type STORED_LIST = new TypeToken<List<StoredJson>>(){}.getType();
+    private static final String FILE_NAME = "permahuen_fakeplayers.json";
 
-        private final Map<String, Stored> byName = new LinkedHashMap<>();
+    private Path filePath() {
+        if (server == null) return null;
+        Path root = server.getSavePath(WorldSavePath.ROOT);
+        return root.resolve(FILE_NAME);
+    }
 
-        static State get(MinecraftServer server) {
-            PersistentStateManager mgr = server.getOverworld().getPersistentStateManager();
-            return mgr.getOrCreate(State::fromNbt, State::new, NAME);
-        }
+    private void readFromDisk() {
+        records.clear();
+        Path file = filePath();
+        if (file == null || !Files.exists(file)) return;
 
-        Collection<Stored> all() { return byName.values(); }
-
-        void put(Stored s) {
-            byName.put(s.name(), s);
-            markDirty();
-        }
-
-        Stored remove(String name) {
-            Stored s = byName.remove(name);
-            if (s != null) markDirty();
-            return s;
-        }
-
-        @Override
-        public NbtCompound writeNbt(NbtCompound nbt, NbtOps ops) {
-            NbtList list = new NbtList();
-            for (Stored s : byName.values()) {
-                NbtCompound t = new NbtCompound();
-                if (s.uuid() != null) t.putUuid("uuid", s.uuid());
-                t.putString("name", s.name());
-                t.putString("dim", s.dimension().getValue().toString());
-                t.putInt("x", s.pos().getX());
-                t.putInt("y", s.pos().getY());
-                t.putInt("z", s.pos().getZ());
-                t.putInt("radius", s.radius());
-                list.add(t);
-            }
-            nbt.put("records", list);
-            return nbt;
-        }
-
-        static State fromNbt(NbtCompound nbt, NbtOps ops) {
-            State st = new State();
-            NbtList list = nbt.getList("records", NbtElement.COMPOUND_TYPE);
-            for (int i = 0; i < list.size(); i++) {
-                NbtCompound t = list.getCompound(i);
-
-                UUID uuid = t.containsUuid("uuid") ? t.getUuid("uuid") : null;
-                String name = t.getString("name");
-
-                // Build Identifier using 2-arg constructor to avoid single-arg constructor issues
-                String worldId = t.getString("dim");
-                Identifier id;
-                int idx = worldId.indexOf(':');
-                if (idx >= 0) {
-                    id = new Identifier(worldId.substring(0, idx), worldId.substring(idx + 1));
-                } else {
-                    // fallback if stored as "overworld" etc.
-                    id = new Identifier("minecraft", worldId);
-                }
+        try (BufferedReader r = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+            List<StoredJson> list = GSON.fromJson(r, STORED_LIST);
+            if (list == null) return;
+            for (StoredJson j : list) {
+                Identifier id = Identifier.tryParse(j.dimension);
+                if (id == null) continue;
                 RegistryKey<World> dim = RegistryKey.of(RegistryKeys.WORLD, id);
-
-                BlockPos pos = new BlockPos(t.getInt("x"), t.getInt("y"), t.getInt("z"));
-                int radius = t.getInt("radius");
-
-                st.byName.put(name, new Stored(uuid, name, dim, pos, radius));
+                Stored s = new Stored(j.uuid, j.name, dim, j.x, j.y, j.z, j.radius);
+                records.put(s.name, s);
             }
-            return st;
+        } catch (IOException ignored) { }
+    }
+
+    private void writeToDisk() {
+        Path file = filePath();
+        if (file == null) return;
+        try {
+            Files.createDirectories(file.getParent());
+            List<StoredJson> list = new ArrayList<>();
+            for (Stored s : records.values()) {
+                list.add(new StoredJson(s.uuid, s.name, s.dimension.getValue().toString(), s.x, s.y, s.z, s.radius));
+            }
+            try (BufferedWriter w = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {
+                GSON.toJson(list, STORED_LIST, w);
+            }
+        } catch (IOException ignored) { }
+    }
+
+    private static class StoredJson {
+        UUID uuid;
+        String name;
+        String dimension; // "minecraft:overworld", etc.
+        int x, y, z;
+        int radius;
+
+        StoredJson(UUID uuid, String name, String dimension, int x, int y, int z, int radius) {
+            this.uuid = uuid;
+            this.name = name;
+            this.dimension = dimension;
+            this.x = x; this.y = y; this.z = z;
+            this.radius = radius;
         }
     }
 
-    /* ------------------------------------------------------------ */
-    /* Optional: pretty listing to a command source                 */
-    /* ------------------------------------------------------------ */
+    /* ---------- Optional pretty output for /list ---------- */
 
-    public static void sendListTo(MinecraftServer server, net.minecraft.server.command.ServerCommandSource src) {
-        Collection<Stored> all = list(server);
-        if (all.isEmpty()) {
+    public void sendListTo(net.minecraft.server.command.ServerCommandSource src) {
+        if (records.isEmpty()) {
             src.sendFeedback(() -> Text.literal("No persistent fake players."), false);
-        } else {
-            for (Stored s : all) {
-                src.sendFeedback(() -> Text.literal(
-                    "- " + s.name() + " @ " + s.pos().toShortString() +
-                    " in " + s.dimension().getValue() +
-                    " (radius " + s.radius() + ")"
-                ), false);
-            }
+            return;
+        }
+        for (Stored s : records.values()) {
+            src.sendFeedback(() -> Text.literal(
+                "- " + s.name + " @ " + s.x + "," + s.y + "," + s.z +
+                " in " + s.dimension.getValue() + " (radius " + s.radius + ")"
+            ), false);
         }
     }
 }
