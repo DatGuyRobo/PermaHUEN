@@ -29,7 +29,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class FakePlayerManager {
     private final Map<String, ServerPlayerEntity> fakePlayers = new ConcurrentHashMap<>();
-    private final Path configPath = Paths.get("config", PermahuenMod.MOD_ID + ".json");
+    private final Path configPath = Paths.get("config", permahuen.MOD_ID + ".json");
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
     // A custom ticket type to distinguish our chunk loaders
@@ -59,7 +59,7 @@ public class FakePlayerManager {
         forceLoadChunk(world, player.getBlockPos());
         fakePlayers.put(name.toLowerCase(), player);
         
-        PermahuenMod.LOGGER.info("Spawned fake player '{}' at {}", name, pos.toShortString());
+        permahuen.LOGGER.info("Spawned fake player '{}' at {}", name, pos.toShortString());
         save();
         return true;
     }
@@ -69,7 +69,7 @@ public class FakePlayerManager {
         if (player != null) {
             unLoadChunk((ServerWorld) player.getWorld(), player.getBlockPos());
             player.kill(); // This removes the entity from the world
-            PermahuenMod.LOGGER.info("Killed fake player '{}'", name);
+            permahuen.LOGGER.info("Killed fake player '{}'", name);
             save();
             return true;
         }
@@ -82,12 +82,12 @@ public class FakePlayerManager {
 
     private void forceLoadChunk(ServerWorld world, BlockPos pos) {
         world.getChunkManager().addTicket(FAKE_PLAYER_TICKET, pos.toChunkPos(), 3, pos.toShortString());
-        PermahuenMod.LOGGER.info("Forceloading chunk at {}", pos.toChunkPos());
+        permahuen.LOGGER.info("Forceloading chunk at {}", pos.toChunkPos());
     }
 
     private void unLoadChunk(ServerWorld world, BlockPos pos) {
         world.getChunkManager().removeTicket(FAKE_PLAYER_TICKET, pos.toChunkPos(), 3, pos.toShortString());
-        PermahuenMod.LOGGER.info("Unloading chunk at {}", pos.toChunkPos());
+        permahuen.LOGGER.info("Unloading chunk at {}", pos.toChunkPos());
     }
 
     public void save() {
@@ -108,7 +108,7 @@ public class FakePlayerManager {
                 gson.toJson(playerDataList, writer);
             }
         } catch (IOException e) {
-            PermahuenMod.LOGGER.error("Failed to save fake players:", e);
+            permahuen.LOGGER.error("Failed to save fake players:", e);
         }
     }
 
@@ -132,13 +132,13 @@ public class FakePlayerManager {
                         BlockPos pos = new BlockPos((int)data.x(), (int)data.y(), (int)data.z());
                         spawnPlayer(server, data.name(), worldOpt.get(), pos);
                     } else {
-                        PermahuenMod.LOGGER.warn("World '{}' for fake player '{}' not found.", data.world(), data.name());
+                        permahuen.LOGGER.warn("World '{}' for fake player '{}' not found.", data.world(), data.name());
                     }
                 }
-                PermahuenMod.LOGGER.info("Loaded {} fake players from config.", playerDataList.size());
+                permahuen.LOGGER.info("Loaded {} fake players from config.", playerDataList.size());
             }
         } catch (IOException e) {
-            PermahuenMod.LOGGER.error("Failed to load fake players:", e);
+            permahuen.LOGGER.error("Failed to load fake players:", e);
         }
     }
 

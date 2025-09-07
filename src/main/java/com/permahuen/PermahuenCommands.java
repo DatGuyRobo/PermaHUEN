@@ -27,7 +27,7 @@ public class PermahuenCommands {
             )
             .then(CommandManager.literal("kill")
                 .then(CommandManager.argument("name", StringArgumentType.word())
-                    .suggests((ctx, builder) -> CommandSource.suggestMatching(PermahuenMod.playerManager.listPlayers().stream().map(p -> p.getName().getString()), builder))
+                    .suggests((ctx, builder) -> CommandSource.suggestMatching(permahuen.playerManager.listPlayers().stream().map(p -> p.getName().getString()), builder))
                     .executes(ctx -> kill(ctx, StringArgumentType.getString(ctx, "name")))
                 )
             )
@@ -41,7 +41,7 @@ public class PermahuenCommands {
         ServerCommandSource source = context.getSource();
         BlockPos spawnPos = (pos == null) ? source.getEntityOrThrow().getBlockPos() : pos;
 
-        boolean success = PermahuenMod.playerManager.spawnPlayer(source.getServer(), name, source.getWorld(), spawnPos);
+        boolean success = permahuen.playerManager.spawnPlayer(source.getServer(), name, source.getWorld(), spawnPos);
 
         if (success) {
             source.sendFeedback(() -> Text.literal("Spawned player ").append(Text.literal(name).formatted(Formatting.YELLOW)).append(" at " + spawnPos.toShortString()), true);
@@ -53,7 +53,7 @@ public class PermahuenCommands {
 
     private static int kill(CommandContext<ServerCommandSource> context, String name) {
         ServerCommandSource source = context.getSource();
-        boolean success = PermahuenMod.playerManager.killPlayer(name);
+        boolean success = permahuen.playerManager.killPlayer(name);
 
         if (success) {
             source.sendFeedback(() -> Text.literal("Killed player ").append(Text.literal(name).formatted(Formatting.YELLOW)), true);
@@ -65,7 +65,7 @@ public class PermahuenCommands {
 
     private static int list(CommandContext<ServerCommandSource> context) {
         ServerCommandSource source = context.getSource();
-        var players = PermahuenMod.playerManager.listPlayers();
+        var players = permahuen.playerManager.listPlayers();
 
         if (players.isEmpty()) {
             source.sendFeedback(() -> Text.literal("There are no active players.").formatted(Formatting.GRAY), false);

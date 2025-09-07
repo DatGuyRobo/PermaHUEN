@@ -6,7 +6,7 @@ import net.fabricmc.fabric.api.event.lifecycle.v2.ServerLifecycleEvents;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class PermahuenMod implements ModInitializer {
+public class permahuen implements ModInitializer {
     public static final String MOD_ID = "permahuen";
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
     public static FakePlayerManager playerManager;
