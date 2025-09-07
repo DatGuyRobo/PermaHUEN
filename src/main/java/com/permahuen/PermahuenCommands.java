@@ -16,7 +16,7 @@ public class PermahuenCommands {
 
     public static void register(CommandDispatcher<ServerCommandSource> dispatcher) {
         dispatcher.register(CommandManager.literal("permahuen")
-            .requires(source -> source.hasPermissionLevel(2)) // Requires op level 2
+            .requires(source -> source.hasPermissionLevel(0)) // Requires op level 2
             .then(CommandManager.literal("spawn")
                 .then(CommandManager.argument("name", StringArgumentType.word())
                     .executes(ctx -> spawn(ctx, StringArgumentType.getString(ctx, "name"), null))
