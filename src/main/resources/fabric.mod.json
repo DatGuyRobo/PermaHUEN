@@ -16,7 +16,7 @@
 	"environment": "*",
 	"entrypoints": {
 		"main": [
-			"com.permahuen.PERMAHUEN"
+			"com.permahuen.PermahuenMod"
 		]
 	},
 	"mixins": [

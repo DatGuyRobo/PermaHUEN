@@ -9,10 +9,11 @@ import net.minecraft.entity.effect.StatusEffectInstance;
 import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ChunkTicketType; // Corrected import
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.GameMode;
-import net.minecraft.world.chunk.ChunkTicketType;
 
 import java.io.FileReader;
 import java.io.FileWriter;
@@ -29,12 +30,11 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class FakePlayerManager {
     private final Map<String, ServerPlayerEntity> fakePlayers = new ConcurrentHashMap<>();
-    private final Path configPath = Paths.get("config", permahuen.MOD_ID + ".json");
+    private final Path configPath = Paths.get("config", PermahuenMod.MOD_ID + ".json");
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
-    // A custom ticket type to distinguish our chunk loaders
-    private static final ChunkTicketType<String> FAKE_PLAYER_TICKET =
-            ChunkTicketType.create("fake_player", String::compareTo, 600);
+    private static final ChunkTicketType<BlockPos> FAKE_PLAYER_TICKET =
+            ChunkTicketType.create("permahuen_player", BlockPos::compareTo, 600);
 
     public boolean spawnPlayer(MinecraftServer server, String name, ServerWorld world, BlockPos pos) {
         if (fakePlayers.containsKey(name.toLowerCase())) {
@@ -42,7 +42,8 @@ public class FakePlayerManager {
         }
 
         GameProfile profile = new GameProfile(null, name);
-        FakePlayer player = FakePlayer.create(world, profile);
+        // Corrected variable type from FakePlayer to ServerPlayerEntity
+        ServerPlayerEntity player = FakePlayer.create(world, profile);
         
         player.refreshPositionAndAngles(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, 0, 0);
         player.changeGameMode(GameMode.SURVIVAL);
@@ -55,11 +56,12 @@ public class FakePlayerManager {
         player.addStatusEffect(new StatusEffectInstance(StatusEffects.SATURATION, -1, 0, false, false));
         player.getHungerManager().setFoodLevel(20);
 
-        world.spawnNewEntity(player);
+        // Corrected method call
+        world.spawnEntity(player);
         forceLoadChunk(world, player.getBlockPos());
         fakePlayers.put(name.toLowerCase(), player);
         
-        permahuen.LOGGER.info("Spawned fake player '{}' at {}", name, pos.toShortString());
+        PermahuenMod.LOGGER.info("Spawned fake player '{}' at {}", name, pos.toShortString());
         save();
         return true;
     }
@@ -68,8 +70,9 @@ public class FakePlayerManager {
         ServerPlayerEntity player = fakePlayers.remove(name.toLowerCase());
         if (player != null) {
             unLoadChunk((ServerWorld) player.getWorld(), player.getBlockPos());
-            player.kill(); // This removes the entity from the world
-            permahuen.LOGGER.info("Killed fake player '{}'", name);
+            // Corrected way to remove an entity
+            player.remove(ServerPlayerEntity.RemovalReason.KILLED);
+            PermahuenMod.LOGGER.info("Killed fake player '{}'", name);
             save();
             return true;
         }
@@ -81,13 +84,15 @@ public class FakePlayerManager {
     }
 
     private void forceLoadChunk(ServerWorld world, BlockPos pos) {
-        world.getChunkManager().addTicket(FAKE_PLAYER_TICKET, pos.toChunkPos(), 3, pos.toShortString());
-        permahuen.LOGGER.info("Forceloading chunk at {}", pos.toChunkPos());
+        // Corrected method call
+        world.getChunkManager().addTicket(FAKE_PLAYER_TICKET, new ChunkPos(pos), 3, pos);
+        PermahuenMod.LOGGER.info("Forceloading chunk at {}", new ChunkPos(pos));
     }
 
     private void unLoadChunk(ServerWorld world, BlockPos pos) {
-        world.getChunkManager().removeTicket(FAKE_PLAYER_TICKET, pos.toChunkPos(), 3, pos.toShortString());
-        permahuen.LOGGER.info("Unloading chunk at {}", pos.toChunkPos());
+        // Corrected method call
+        world.getChunkManager().removeTicket(FAKE_PLAYER_TICKET, new ChunkPos(pos), 3, pos);
+        PermahuenMod.LOGGER.info("Unloading chunk at {}", new ChunkPos(pos));
     }
 
     public void save() {
@@ -108,7 +113,7 @@ public class FakePlayerManager {
                 gson.toJson(playerDataList, writer);
             }
         } catch (IOException e) {
-            permahuen.LOGGER.error("Failed to save fake players:", e);
+            PermahuenMod.LOGGER.error("Failed to save fake players:", e);
         }
     }
 
@@ -129,16 +134,16 @@ public class FakePlayerManager {
                             .map(server::getWorld);
 
                     if (worldOpt.isPresent()) {
-                        BlockPos pos = new BlockPos((int)data.x(), (int)data.y(), (int)data.z());
+                        BlockPos pos = BlockPos.ofFloored(data.x(), data.y(), data.z());
                         spawnPlayer(server, data.name(), worldOpt.get(), pos);
                     } else {
-                        permahuen.LOGGER.warn("World '{}' for fake player '{}' not found.", data.world(), data.name());
+                        PermahuenMod.LOGGER.warn("World '{}' for fake player '{}' not found.", data.world(), data.name());
                     }
                 }
-                permahuen.LOGGER.info("Loaded {} fake players from config.", playerDataList.size());
+                PermahuenMod.LOGGER.info("Loaded {} fake players from config.", playerDataList.size());
             }
         } catch (IOException e) {
-            permahuen.LOGGER.error("Failed to load fake players:", e);
+            PermahuenMod.LOGGER.error("Failed to load fake players:", e);
         }
     }
 
