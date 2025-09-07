@@ -1,270 +1,260 @@
 package com.permahuen;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonSyntaxException;
-import com.google.gson.reflect.TypeToken;
 import com.mojang.authlib.GameProfile;
 import net.fabricmc.fabric.api.entity.FakePlayer;
-import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.minecraft.entity.effect.StatusEffectInstance;
 import net.minecraft.entity.effect.StatusEffects;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtElement;
+import net.minecraft.nbt.NbtList;
+import net.minecraft.nbt.NbtOps;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.RegistryKeys;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.server.world.ChunkTicketType;
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
-import net.minecraft.world.GameMode;
+import net.minecraft.world.PersistentState;
+import net.minecraft.world.PersistentStateManager;
 import net.minecraft.world.World;
 
-import java.io.FileReader;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.lang.reflect.Type;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Manages lifecycle of Fabric FakePlayers and keeps their spawn chunks loaded.
- * - Uses FORCED chunk tickets with tracked anchors to avoid leaks.
- * - Assigns stable offline UUIDs for consistent identity.
- * - Applies effectively-infinite status effects using Integer.MAX_VALUE.
- * - Persists/restores players across restarts (name, world id, position).
- * - Cleans up chunk tickets on server stop.
+ * Manager for persistent, chunk-loading fake players.
+ *
+ * Public API:
+ *  - spawn(server, name, world, pos, radius)
+ *  - kill(server, name)
+ *  - list(server)
+ *  - respawnAll(server)  // call on SERVER_STARTED
  */
 public class FakePlayerManager {
 
-    /** Lowercased name -> fake player instance */
-    private final Map<String, ServerPlayerEntity> fakePlayers = new ConcurrentHashMap<>();
+    /** Spawns (or updates) a persistent fake player at the given position and radius. */
+    public static ServerPlayerEntity spawn(MinecraftServer server, String name, ServerWorld world, BlockPos pos, int radius) {
+        Objects.requireNonNull(server, "server");
+        Objects.requireNonNull(world, "world");
+        Objects.requireNonNull(name, "name");
+        if (radius < 0) radius = 0;
 
-    /** Lowercased name -> ticket anchor ChunkPos used at spawn time */
-    private final Map<String, ChunkPos> ticketAnchors = new ConcurrentHashMap<>();
+        // Build a GameProfile and try to pull the user's skin
+        GameProfile profile = new GameProfile(null, name);
+        try {
+            server.getSessionService().fillProfileProperties(profile, true);
+        } catch (Exception ignored) { }
 
-    private final Path configPath = Paths.get("config", PermahuenMod.MOD_ID + ".json");
-    private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+        // Get/create the FakePlayer instance
+        ServerPlayerEntity fp = FakePlayer.get(world, profile);
 
-    /** Use vanilla FORCED tickets; argument type: ChunkPos */
-    private static final ChunkTicketType<ChunkPos> FORCED = ChunkTicketType.FORCED;
-
-    public FakePlayerManager() {
-        // Ensure chunk tickets are removed on clean shutdown even if callers forget.
-        ServerLifecycleEvents.SERVER_STOPPING.register(this::cleanupOnStop);
-    }
-
-    /* =========================
-       === Public API ==========
-       ========================= */
-
-    /**
-     * Spawns a fake player with the given name at pos in the given world.
-     * Keeps the spawn chunk loaded via a FORCED ticket until {@link #killPlayer(String)} is called
-     * or the server stops.
-     *
-     * @return true if spawned; false if a fake with that name already exists
-     */
-    public boolean spawnPlayer(MinecraftServer server, String name, ServerWorld world, BlockPos pos) {
-        final String key = key(name);
-        if (fakePlayers.containsKey(key)) {
-            return false;
+        // Move to target position and ensure it ticks
+        fp.refreshPositionAndAngles(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, fp.getYaw(), fp.getPitch());
+        if (!world.getPlayers().contains(fp)) {
+            world.spawnEntity(fp);
         }
 
-        // Stable offline UUID for consistency across restarts.
-        UUID uuid = UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(StandardCharsets.UTF_8));
-        GameProfile profile = new GameProfile(uuid, name);
+        // Survival-safe buffs
+        applyBuffs(fp);
 
-        // Create or get the FakePlayer.
-        ServerPlayerEntity player = FakePlayer.get(world, profile);
+        // Keep chunks loaded in a square radius
+        forceChunks(world, pos, radius, true);
 
-        // Position & basic state
-        player.refreshPositionAndAngles(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, 0f, 0f);
+        // Persist record
+        State state = State.get(server);
+        Stored stored = new Stored(fp.getGameProfile().getId(), name, world.getRegistryKey(), pos, radius);
+        state.put(stored);
+        state.markDirty();
 
-        // Depending on mappings/MC version, changeGameMode or setGameMode may be available.
-        try {
-            player.changeGameMode(GameMode.SURVIVAL);
-        } catch (Throwable t) {
-            try {
-                // Fallback if changeGameMode isn't present in your target version
-                player.setGameMode(GameMode.SURVIVAL);
-            } catch (Throwable ignored) {
-                // Last resort: ignore—game mode not critical for headless bots
+        return fp;
+    }
+
+    /** Despawns and removes a persistent fake player by name. */
+    public static boolean kill(MinecraftServer server, String name) {
+        Objects.requireNonNull(server, "server");
+        Objects.requireNonNull(name, "name");
+
+        State state = State.get(server);
+        Stored stored = state.remove(name);
+        if (stored == null) return false;
+
+        ServerWorld world = server.getWorld(stored.dimension());
+        if (world != null) {
+            // Unforce chunks
+            forceChunks(world, stored.pos(), stored.radius(), false);
+
+            // Discard entity if present
+            GameProfile profile = new GameProfile(stored.uuid(), stored.name());
+            ServerPlayerEntity fp = FakePlayer.get(world, profile);
+            if (fp != null) {
+                fp.discard();
             }
         }
 
-        // Keep the bot durable / maintenance-free.
-        final int INF = Integer.MAX_VALUE;
-        player.setInvulnerable(true);
-        player.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE,      INF, 4, false, false));
-        player.addStatusEffect(new StatusEffectInstance(StatusEffects.FIRE_RESISTANCE, INF, 0, false, false));
-        player.addStatusEffect(new StatusEffectInstance(StatusEffects.WATER_BREATHING, INF, 0, false, false));
-        player.addStatusEffect(new StatusEffectInstance(StatusEffects.SATURATION,      INF, 0, false, false));
-        player.getHungerManager().setFoodLevel(20);
-        player.getHungerManager().setSaturationLevel(20f);
-
-        // In most setups, FakePlayer.get(...) provides a valid entity; spawning is typically fine.
-        // If you see "already added to world" logs in your environment, comment out the next line.
-        world.spawnEntity(player);
-
-        // Forceload spawn chunk and remember the exact anchor used so we can unload correctly later.
-        forceLoadChunk(world, key, player.getBlockPos());
-
-        fakePlayers.put(key, player);
-
-        PermahuenMod.LOGGER.info("Spawned fake player '{}' at {} in world {}", name, pos.toShortString(),
-                world.getRegistryKey().getValue());
-        save();
+        state.markDirty();
         return true;
     }
 
-    /**
-     * Removes the fake player by name and releases its chunk ticket.
-     *
-     * @return true if a player with that name existed and was removed; false otherwise.
-     */
-    public boolean killPlayer(String name) {
-        final String key = key(name);
-        ServerPlayerEntity player = fakePlayers.remove(key);
-        if (player != null) {
-            ServerWorld world = (ServerWorld) player.getWorld();
-            unLoadChunk(world, key);
-            player.remove(ServerPlayerEntity.RemovalReason.KILLED);
-            PermahuenMod.LOGGER.info("Killed fake player '{}'", name);
-            save();
-            return true;
-        }
-        return false;
+    /** Returns all stored fake players (immutable). */
+    public static Collection<Stored> list(MinecraftServer server) {
+        return Collections.unmodifiableCollection(State.get(server).all());
     }
 
-    /** Returns an unmodifiable snapshot of current fake players. */
-    public List<ServerPlayerEntity> listPlayers() {
-        return List.copyOf(fakePlayers.values());
-    }
+    /** Re-spawn all stored fake players. Call this on SERVER_STARTED. */
+    public static void respawnAll(MinecraftServer server) {
+        State state = State.get(server);
+        int count = 0;
+        for (Stored s : state.all()) {
+            try {
+                ServerWorld world = server.getWorld(s.dimension());
+                if (world == null) continue;
 
-    /** Persist current fake players to disk. */
-    public void save() {
-        List<FakePlayerData> playerDataList = new ArrayList<>();
-        for (ServerPlayerEntity player : fakePlayers.values()) {
-            playerDataList.add(new FakePlayerData(
-                    player.getName().getString(),
-                    player.getWorld().getRegistryKey().getValue().toString(),
-                    player.getX(),
-                    player.getY(),
-                    player.getZ()
-            ));
-        }
+                GameProfile profile = new GameProfile(s.uuid(), s.name());
+                try { server.getSessionService().fillProfileProperties(profile, true); } catch (Exception ignored) { }
 
-        try {
-            Files.createDirectories(configPath.getParent());
-            try (FileWriter writer = new FileWriter(configPath.toFile())) {
-                gson.toJson(playerDataList, writer);
-            }
-        } catch (IOException e) {
-            PermahuenMod.LOGGER.error("Failed to save fake players:", e);
-        }
-    }
-
-    /** Load previously saved fake players and spawn them. */
-    public void load(MinecraftServer server) {
-        if (!Files.exists(configPath)) {
-            return;
-        }
-
-        try (FileReader reader = new FileReader(configPath.toFile())) {
-            Type listType = new TypeToken<ArrayList<FakePlayerData>>() {}.getType();
-            List<FakePlayerData> playerDataList = gson.fromJson(reader, listType);
-
-            if (playerDataList != null) {
-                for (FakePlayerData data : playerDataList) {
-                    ServerWorld world = resolveWorld(server, data.world());
-                    if (world != null) {
-                        BlockPos pos = BlockPos.ofFloored(data.x(), data.y(), data.z());
-                        spawnPlayer(server, data.name(), world, pos);
-                    } else {
-                        PermahuenMod.LOGGER.warn("World '{}' for fake player '{}' not found.", data.world(), data.name());
-                    }
+                ServerPlayerEntity fp = FakePlayer.get(world, profile);
+                BlockPos pos = s.pos();
+                fp.refreshPositionAndAngles(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, fp.getYaw(), fp.getPitch());
+                if (!world.getPlayers().contains(fp)) {
+                    world.spawnEntity(fp);
                 }
-                PermahuenMod.LOGGER.info("Loaded {} fake players from config.", playerDataList.size());
+                applyBuffs(fp);
+                forceChunks(world, pos, s.radius(), true);
+                count++;
+            } catch (Exception e) {
+                server.getLogger().error("[FakePlayerManager] Failed to respawn {}: {}", s.name(), e.toString());
             }
-        } catch (JsonSyntaxException e) {
-            PermahuenMod.LOGGER.error("Malformed fake players JSON at {}: {}", configPath, e.getMessage());
-        } catch (IOException e) {
-            PermahuenMod.LOGGER.error("Failed to load fake players:", e);
+        }
+        server.getLogger().info("[FakePlayerManager] Respawned {} fake players.", count);
+    }
+
+    /* ------------------------------------------------------------ */
+    /* Helpers                                                      */
+    /* ------------------------------------------------------------ */
+
+    private static void forceChunks(ServerWorld world, BlockPos pos, int radius, boolean force) {
+        ChunkPos cp = new ChunkPos(pos);
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                world.setChunkForced(cp.x + dx, cp.z + dz, force);
+            }
         }
     }
 
-    /* =========================
-       === Internals ===========
-       ========================= */
-
-    private static String key(String name) {
-        return name.toLowerCase(Locale.ROOT);
+    /** Survival-safe: invulnerable + long-duration defensive effects. */
+    private static void applyBuffs(ServerPlayerEntity p) {
+        p.setInvulnerable(true);
+        ensureEffect(p, StatusEffects.RESISTANCE,       20 * 60 * 60, 4); // Resistance V
+        ensureEffect(p, StatusEffects.REGENERATION,     20 * 60 * 60, 2); // Regeneration III
+        ensureEffect(p, StatusEffects.SATURATION,       20 * 60 * 60, 0); // No hunger
+        ensureEffect(p, StatusEffects.FIRE_RESISTANCE,  20 * 60 * 60, 0);
+        ensureEffect(p, StatusEffects.WATER_BREATHING,  20 * 60 * 60, 0);
     }
 
-    private static ChunkPos chunkOf(BlockPos pos) {
-        return new ChunkPos(pos);
+    private static void ensureEffect(ServerPlayerEntity p, net.minecraft.entity.effect.StatusEffect effect, int duration, int amplifier) {
+        StatusEffectInstance cur = p.getStatusEffect(effect);
+        if (cur == null || cur.getDuration() < 20 * 30 || cur.getAmplifier() < amplifier) {
+            p.addStatusEffect(new StatusEffectInstance(effect, duration, amplifier, true, false));
+        }
     }
 
-    private void forceLoadChunk(ServerWorld world, String key, BlockPos pos) {
-        ChunkPos cp = chunkOf(pos);
-        // Level 2 is conventional for permanent forced loading
-        world.getChunkManager().addTicket(FORCED, cp, 2, cp);
-        ticketAnchors.put(key, cp);
-        PermahuenMod.LOGGER.info("Forceloading chunk {}", cp);
+    /* ------------------------------------------------------------ */
+    /* Persistent State                                             */
+    /* ------------------------------------------------------------ */
+
+    /** Immutable stored record. */
+    public record Stored(UUID uuid, String name, RegistryKey<World> dimension, BlockPos pos, int radius) { }
+
+    /** Persistent state kept in the Overworld's save data. */
+    static class State extends PersistentState {
+        private static final String NAME = "permahuen_fakeplayer_state_v1";
+
+        private final Map<String, Stored> byName = new LinkedHashMap<>();
+
+        static State get(MinecraftServer server) {
+            PersistentStateManager mgr = server.getOverworld().getPersistentStateManager();
+            return mgr.getOrCreate(State::fromNbt, State::new, NAME);
+        }
+
+        Collection<Stored> all() { return byName.values(); }
+
+        void put(Stored s) {
+            byName.put(s.name(), s);
+            markDirty();
+        }
+
+        Stored remove(String name) {
+            Stored s = byName.remove(name);
+            if (s != null) markDirty();
+            return s;
+        }
+
+        @Override
+        public NbtCompound writeNbt(NbtCompound nbt, NbtOps ops) {
+            NbtList list = new NbtList();
+            for (Stored s : byName.values()) {
+                NbtCompound t = new NbtCompound();
+                if (s.uuid() != null) t.putUuid("uuid", s.uuid());
+                t.putString("name", s.name());
+                t.putString("dim", s.dimension().getValue().toString());
+                t.putInt("x", s.pos().getX());
+                t.putInt("y", s.pos().getY());
+                t.putInt("z", s.pos().getZ());
+                t.putInt("radius", s.radius());
+                list.add(t);
+            }
+            nbt.put("records", list);
+            return nbt;
+        }
+
+        static State fromNbt(NbtCompound nbt, NbtOps ops) {
+            State st = new State();
+            NbtList list = nbt.getList("records", NbtElement.COMPOUND_TYPE);
+            for (int i = 0; i < list.size(); i++) {
+                NbtCompound t = list.getCompound(i);
+
+                UUID uuid = t.containsUuid("uuid") ? t.getUuid("uuid") : null;
+                String name = t.getString("name");
+
+                // Build Identifier using 2-arg constructor to avoid single-arg constructor issues
+                String worldId = t.getString("dim");
+                Identifier id;
+                int idx = worldId.indexOf(':');
+                if (idx >= 0) {
+                    id = new Identifier(worldId.substring(0, idx), worldId.substring(idx + 1));
+                } else {
+                    // fallback if stored as "overworld" etc.
+                    id = new Identifier("minecraft", worldId);
+                }
+                RegistryKey<World> dim = RegistryKey.of(RegistryKeys.WORLD, id);
+
+                BlockPos pos = new BlockPos(t.getInt("x"), t.getInt("y"), t.getInt("z"));
+                int radius = t.getInt("radius");
+
+                st.byName.put(name, new Stored(uuid, name, dim, pos, radius));
+            }
+            return st;
+        }
     }
 
-    private void unLoadChunk(ServerWorld world, String key) {
-        ChunkPos cp = ticketAnchors.remove(key);
-        if (cp != null) {
-            world.getChunkManager().removeTicket(FORCED, cp, 2, cp);
-            PermahuenMod.LOGGER.info("Unloading chunk {}", cp);
+    /* ------------------------------------------------------------ */
+    /* Optional: pretty listing to a command source                 */
+    /* ------------------------------------------------------------ */
+
+    public static void sendListTo(MinecraftServer server, net.minecraft.server.command.ServerCommandSource src) {
+        Collection<Stored> all = list(server);
+        if (all.isEmpty()) {
+            src.sendFeedback(() -> Text.literal("No persistent fake players."), false);
         } else {
-            PermahuenMod.LOGGER.warn("No ticket anchor recorded for '{}'; nothing to unload.", key);
-        }
-    }
-
-    private void cleanupOnStop(MinecraftServer server) {
-        // Remove any remaining FORCED tickets to avoid leaks across restarts.
-        for (Map.Entry<String, ChunkPos> e : ticketAnchors.entrySet()) {
-            String k = e.getKey();
-            ChunkPos cp = e.getValue();
-            ServerPlayerEntity p = fakePlayers.get(k);
-            ServerWorld world = null;
-            if (p != null) {
-                world = (ServerWorld) p.getWorld();
-            } else {
-                // Fallback: try to infer world from saved data (best effort)
-                // Not strictly necessary because tickets are world-scoped;
-                // if we don't have the world we can't remove anyway.
-            }
-            if (world != null) {
-                world.getChunkManager().removeTicket(FORCED, cp, 2, cp);
+            for (Stored s : all) {
+                src.sendFeedback(() -> Text.literal(
+                    "- " + s.name() + " @ " + s.pos().toShortString() +
+                    " in " + s.dimension().getValue() +
+                    " (radius " + s.radius() + ")"
+                ), false);
             }
         }
-        ticketAnchors.clear();
-        PermahuenMod.LOGGER.info("Cleaned up fake player chunk tickets on server stop.");
     }
-
-    private ServerWorld resolveWorld(MinecraftServer server, String worldId) {
-        try {
-            Identifier id = new Identifier(worldId);
-            RegistryKey<World> key = RegistryKey.of(RegistryKeys.WORLD, id);
-            return server.getWorld(key);
-        } catch (Exception e) {
-            PermahuenMod.LOGGER.warn("Invalid world identifier '{}': {}", worldId, e.getMessage());
-            return null;
-        }
-    }
-
-    /* =========================
-       === Persistence DTO =====
-       ========================= */
-
-    private record FakePlayerData(String name, String world, double x, double y, double z) {}
 }
